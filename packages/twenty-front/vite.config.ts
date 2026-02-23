@@ -7,10 +7,10 @@ import fs from 'fs';
 import path from 'path';
 import { visualizer } from 'rollup-plugin-visualizer';
 import {
-  defineConfig,
-  loadEnv,
-  type PluginOption,
-  searchForWorkspaceRoot,
+    defineConfig,
+    loadEnv,
+    type PluginOption,
+    searchForWorkspaceRoot,
 } from 'vite';
 import checker from 'vite-plugin-checker';
 import svgr from 'vite-plugin-svgr';
@@ -163,6 +163,7 @@ export default defineConfig(({ command, mode }) => {
         '../../node_modules/.vite',
         '../../node_modules/.cache',
         '../../node_modules/twenty-ui',
+        '@wyw-in-js/vite'
       ],
     },
 

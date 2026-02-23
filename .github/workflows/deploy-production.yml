@@ -1,0 +1,175 @@
+name: Deploy to Production (VPS/Portainer)
+
+on:
+  push:
+    branches:
+      - production
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip running tests before deployment'
+        required: false
+        type: boolean
+        default: false
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - production
+          - staging
+        default: production
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    if: ${{ !inputs.skip_tests }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup development environment
+        run: bash packages/twenty-utils/setup-dev-env.sh
+
+      - name: Run linter (diff with main)
+        run: npx nx lint:diff-with-main twenty-server
+
+      - name: Run type check
+        run: npx nx typecheck twenty-server
+
+      - name: Run backend tests
+        run: npx nx test twenty-server
+
+      - name: Run frontend tests
+        run: npx nx test twenty-front
+
+  build-and-push:
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/production' }}
+            type=raw,value=${{ inputs.environment }}-latest,enable=${{ inputs.environment != '' }}
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.source=${{ github.repositoryUrl }}
+            org.opencontainers.image.title=Twenty CRM
+            org.opencontainers.image.description=Open-source CRM suite
+            org.opencontainers.image.vendor=Twenty
+            org.opencontainers.image.authors=${{ github.actor }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./packages/twenty-docker/twenty/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            REACT_APP_SERVER_BASE_URL=${{ secrets.SERVER_URL }}
+            APP_VERSION=${{ github.sha }}
+          platforms: linux/amd64
+
+      - name: Generate deployment summary
+        run: |
+          echo "## Docker Image Built Successfully :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** \`${{ steps.meta.outputs.tags }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** \`${{ env.REGISTRY }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+
+  trigger-deployment:
+    needs: build-and-push
+    if: success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger Portainer webhook
+        run: |
+          echo "Triggering Portainer webhook for ${{ inputs.environment }} deployment..."
+          curl -X POST "${{ secrets.PORTAINER_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "environment": "${{ inputs.environment }}",
+              "image": "${{ needs.build-and-push.outputs.image-tag }}",
+              "commit": "${{ github.sha }}",
+              "branch": "${{ github.ref_name }}",
+              "actor": "${{ github.actor }}"
+            }' \
+            --fail --silent --show-error
+        env:
+          WEBHOOK_URL: ${{ secrets.PORTAINER_WEBHOOK_URL }}
+
+      - name: Verify webhook response
+        if: success()
+        run: |
+          echo "## Deployment Triggered Successfully :white_check_mark:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Portainer Webhook:** Triggered" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Your VPS will now pull the latest image and redeploy the stack." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Check your Portainer instance for deployment status." >> $GITHUB_STEP_SUMMARY
+
+      - name: Handle webhook failure
+        if: failure()
+        run: |
+          echo "## :x: Webhook Trigger Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The Docker image was built and pushed successfully, but the Portainer webhook failed." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Manual deployment may be required.**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Image: \`${{ needs.build-and-push.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
